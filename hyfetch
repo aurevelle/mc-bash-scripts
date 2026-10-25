@@ -1,0 +1,1614 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prog=${0##*/}
+root=$(dirname "$(readlink -f "$0")")
+data_dir=$root/data
+cfg_file=$data_dir/hyfetch.json
+scale=${HYFETCH_SCALE:-3}
+ua='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36'
+forums_base='https://hypixel.net/player'
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    color_on=1
+else
+    color_on=0
+fi
+
+case ${COLORTERM:-} in
+    *truecolor*|*24bit*) color_mode=true ;;
+    *) color_mode=256 ;;
+esac
+
+C_NAME=$((0xf3f4ff))
+C_UUID=$((0x6f7191))
+C_LABEL=$((0x8a8ca8))
+C_VALUE=$((0xffffff))
+C_BW=$((0xffc857))
+C_SW=$((0x63d2ff))
+C_DUEL=$((0x8be9a8))
+C_BAD=$((0xff6b6b))
+C_GOOD=$((0x74e08c))
+C_WARN=$((0xffc857))
+C_HDR=$((0xff79c6))
+C_DIM=$((0x5c5f73))
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
+note() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+}
+
+usage() {
+    cat >&2 <<EOF
+Usage: $prog <username|uuid>
+       $prog --key <hypixel-api-key>
+       $prog --cubelify <url> [name]
+       $prog --cubelify-remove <url|name>
+EOF
+    exit 2
+}
+
+need_jq() {
+    command -v jq >/dev/null 2>&1 || die "jq is required"
+}
+
+to256() {
+    local r=$1 g=$2 b=$3 avg ir ig ib
+
+    if [ $(( (r > g ? r - g : g - r) )) -lt 10 ] &&
+        [ $(( (g > b ? g - b : b - g) )) -lt 10 ]; then
+        avg=$(( (r + g + b) / 3 ))
+        if [ "$avg" -lt 8 ]; then
+            C256=16
+        elif [ "$avg" -gt 238 ]; then
+            C256=231
+        else
+            C256=$(( 232 + (avg - 8) / 10 ))
+        fi
+        return
+    fi
+
+    if [ "$r" -lt 48 ]; then ir=0
+    elif [ "$r" -gt 238 ]; then ir=5
+    else ir=$(( (r - 35) / 40 ))
+    fi
+    if [ "$g" -lt 48 ]; then ig=0
+    elif [ "$g" -gt 238 ]; then ig=5
+    else ig=$(( (g - 35) / 40 ))
+    fi
+    if [ "$b" -lt 48 ]; then ib=0
+    elif [ "$b" -gt 238 ]; then ib=5
+    else ib=$(( (b - 35) / 40 ))
+    fi
+    C256=$(( 16 + 36 * ir + 6 * ig + ib ))
+}
+
+paint() {
+    local rgb=$1 text=$2 r g b
+
+    if [ "$color_on" -eq 0 ] || [ "${rgb:-0}" -le 0 ]; then
+        printf '%s' "$text"
+        return
+    fi
+
+    r=$(( (rgb >> 16) & 255 ))
+    g=$(( (rgb >> 8) & 255 ))
+    b=$(( rgb & 255 ))
+
+    if [ "$color_mode" = true ]; then
+        printf '\033[38;2;%d;%d;%dm%s\033[0m' "$r" "$g" "$b" "$text"
+    else
+        to256 "$r" "$g" "$b"
+        printf '\033[38;5;%dm%s\033[0m' "$C256" "$text"
+    fi
+}
+
+bold() {
+    if [ "$color_on" -eq 0 ]; then
+        printf '%s' "$1"
+        return
+    fi
+    printf '\033[1m%s\033[0m' "$1"
+}
+
+hdr() {
+    printf '%s %s' "$(paint "$1" '▌')" "$(bold "$(paint "$1" "$2")")"
+}
+
+chip() {
+    printf '%s %s' "$(paint "$C_LABEL" "$1")" "$(paint "${3:-$C_VALUE}" "$2")"
+}
+
+bseg() {
+    bold "$(paint "$1" "$2")"
+}
+
+RANK_TAG=""
+PC=$((0xFF5555))
+MC=$((0xAAAAAA))
+
+mc_color() {
+    case $1 in
+        0) MC=$((0x000000)) ;;
+        1) MC=$((0x0000AA)) ;;
+        2) MC=$((0x00AA00)) ;;
+        3) MC=$((0x00AAAA)) ;;
+        4) MC=$((0xAA0000)) ;;
+        5) MC=$((0xAA00AA)) ;;
+        6) MC=$((0xFFAA00)) ;;
+        7) MC=$((0xAAAAAA)) ;;
+        8) MC=$((0x555555)) ;;
+        9) MC=$((0x5555FF)) ;;
+        a) MC=$((0x55FF55)) ;;
+        b) MC=$((0x55FFFF)) ;;
+        c) MC=$((0xFF5555)) ;;
+        d) MC=$((0xFF55FF)) ;;
+        e) MC=$((0xFFFF55)) ;;
+        f) MC=$((0xFFFFFF)) ;;
+        *) MC=$((0xAAAAAA)) ;;
+    esac
+}
+
+plus_color() {
+    case ${1:-RED} in
+        RED) PC=$((0xFF5555)) ;;
+        BLUE) PC=$((0x5555FF)) ;;
+        GREEN) PC=$((0x55FF55)) ;;
+        YELLOW) PC=$((0xFFFF55)) ;;
+        GOLD) PC=$((0xFFAA00)) ;;
+        LIGHT_PURPLE) PC=$((0xFF55FF)) ;;
+        WHITE) PC=$((0xFFFFFF)) ;;
+        DARK_AQUA) PC=$((0x00AAAA)) ;;
+        DARK_BLUE) PC=$((0x0000AA)) ;;
+        DARK_GRAY) PC=$((0x555555)) ;;
+        DARK_GREEN) PC=$((0x00AA00)) ;;
+        DARK_PURPLE) PC=$((0xAA00AA)) ;;
+        DARK_RED) PC=$((0xAA0000)) ;;
+        *) PC=$((0xFF5555)) ;;
+    esac
+}
+
+render_mc_prefix() {
+    local raw=${1//§/$'\x1f'} out= i chunk code text color=$C_VALUE
+    local -a chunks=()
+
+    IFS=$'\x1f' read -r -a chunks <<<"$raw"
+
+    for ((i = 0; i < ${#chunks[@]}; i++)); do
+        chunk=${chunks[i]}
+        [ -n "$chunk" ] || continue
+        if [ "$i" -gt 0 ]; then
+            code=${chunk:0:1}
+            code=${code,,}
+            text=${chunk:1}
+        else
+            code=
+            text=$chunk
+        fi
+        case $code in
+            [0-9a-f])
+                mc_color "$code"
+                color=$MC
+                ;;
+            r)
+                color=$C_VALUE
+                ;;
+        esac
+        [ -n "$text" ] && out+="$(bseg "$color" "$text")"
+    done
+
+    printf '%s' "$out"
+}
+
+build_rank() {
+    local prefix=$1 rank=$2 new=$3 monthly=$4 plus=$5 pkg=$6 tier=
+    local gold=$((0xFFAA00)) green=$((0x55FF55)) aqua=$((0x55FFFF)) red=$((0xFF5555))
+    local dgreen=$((0x00AA00)) daqua=$((0x00AAAA)) blue=$((0x5555FF))
+
+    RANK_TAG=""
+    plus_color "$plus"
+
+    if [ -n "$prefix" ]; then
+        RANK_TAG="$(render_mc_prefix "$prefix") "
+        return
+    fi
+
+    case $rank in
+        OWNER|ADMIN)
+            RANK_TAG="$(bseg "$red" "[$rank]") "
+            return
+            ;;
+        GAME_MASTER)
+            RANK_TAG="$(bseg "$dgreen" '[GAME MASTER]') "
+            return
+            ;;
+        YOUTUBER|YOUTUBE)
+            RANK_TAG="$(bseg "$red" '[YOUTUBE]') "
+            return
+            ;;
+        BUILD_TEAM)
+            RANK_TAG="$(bseg "$daqua" '[BUILD TEAM]') "
+            return
+            ;;
+        MODERATOR)
+            RANK_TAG="$(bseg "$dgreen" '[MOD]') "
+            return
+            ;;
+        HELPER)
+            RANK_TAG="$(bseg "$blue" '[HELPER]') "
+            return
+            ;;
+        MVP_PLUS_PLUS)
+            tier=MVP_PLUS_PLUS
+            ;;
+    esac
+
+    if [ "$monthly" = SUPERSTAR ]; then
+        tier=MVP_PLUS_PLUS
+    fi
+
+    if [ -z "$tier" ]; then
+        case $new in
+            VIP|VIP_PLUS|MVP|MVP_PLUS)
+                tier=$new
+                ;;
+            *)
+                case $pkg in
+                    VIP|VIP_PLUS|MVP|MVP_PLUS) tier=$pkg ;;
+                    *) tier=$rank ;;
+                esac
+                ;;
+        esac
+    fi
+
+    case $tier in
+        VIP)
+            RANK_TAG="$(bseg "$green" '[VIP]') "
+            ;;
+        VIP_PLUS)
+            RANK_TAG="$(bseg "$green" '[VIP')$(bseg "$gold" '+')$(bseg "$green" ']') "
+            ;;
+        MVP)
+            RANK_TAG="$(bseg "$aqua" '[MVP]') "
+            ;;
+        MVP_PLUS)
+            RANK_TAG="$(bseg "$aqua" '[MVP')$(bseg "$PC" '+')$(bseg "$aqua" ']') "
+            ;;
+        MVP_PLUS_PLUS)
+            if [ "$PC" -eq $((0xFF5555)) ]; then
+                RANK_TAG="$(bseg "$gold" '[MVP')$(bseg "$PC" '++')$(bseg "$gold" ']') "
+            else
+                RANK_TAG="$(bseg "$gold" '[MVP')$(bseg "$PC" '+')$(bseg "$gold" '+]') "
+            fi
+            ;;
+    esac
+}
+
+commas() {
+    local n=${1:-0} sign= i
+    local -a groups=()
+
+    if [ "$n" -lt 0 ]; then
+        sign=-
+        n=$(( -n ))
+    fi
+
+    groups+=("$(( n % 1000 ))")
+    n=$(( n / 1000 ))
+
+    while [ "$n" -gt 0 ]; do
+        groups+=("$(( n % 1000 ))")
+        n=$(( n / 1000 ))
+    done
+
+    printf '%s' "$sign"
+    for ((i = ${#groups[@]} - 1; i >= 0; i--)); do
+        if [ "$i" -eq $(( ${#groups[@]} - 1 )) ]; then
+            printf '%d' "${groups[i]}"
+        else
+            printf ',%03d' "${groups[i]}"
+        fi
+    done
+}
+
+ratio() {
+    local a=${1:-0} b=${2:-0} h
+
+    if [ "$b" -le 0 ]; then
+        if [ "$a" -gt 0 ]; then
+            printf '∞'
+        else
+            printf '0.00'
+        fi
+        return
+    fi
+
+    h=$(( a * 100 / b ))
+    printf '%d.%02d' $(( h / 100 )) $(( h % 100 ))
+}
+
+bw_level() {
+    local xp=${1:-0} level rem i cost
+
+    [ "$xp" -lt 0 ] && xp=0
+    level=$(( (xp / 487000) * 100 ))
+    rem=$(( xp % 487000 ))
+
+    for i in 1 2 3 4; do
+        if [ "$i" -eq 1 ]; then
+            cost=500
+        else
+            cost=$(( 1000 + (i - 1) * 500 ))
+        fi
+        if [ "$rem" -lt "$cost" ]; then
+            printf '%d' "$level"
+            return
+        fi
+        rem=$(( rem - cost ))
+        level=$(( level + 1 ))
+    done
+
+    printf '%d' $(( level + rem / 5000 ))
+}
+
+ensure_config() {
+    mkdir -p "$data_dir"
+    if [ ! -f "$cfg_file" ]; then
+        printf '{}\n' > "$cfg_file"
+    fi
+    jq -e 'type == "object"' "$cfg_file" >/dev/null 2>&1 ||
+        die "$cfg_file is not a JSON object"
+}
+
+getbits() {
+    local n=$1 bi=$(( BP >> 3 )) off=$(( BP & 7 ))
+    local w=$(( IN[bi] | (IN[bi + 1] << 8) | (IN[bi + 2] << 16) ))
+    GB=$(( (w >> off) & ((1 << n) - 1) ))
+    BP=$(( BP + n ))
+}
+
+build_huff() {
+    local n=$1 off=$2 base=$3 i len sym code rev k cnt first
+    for ((len = 0; len <= 15; len++)); do
+        H_COUNT[len]=0
+    done
+    H_SYM=()
+    for ((i = 0; i < n; i++)); do
+        len=${LEN[off + i]}
+        H_COUNT[len]=$(( H_COUNT[len] + 1 ))
+    done
+
+    local -a start=() at=()
+    start[1]=0
+    for ((len = 1; len < 15; len++)); do
+        start[len + 1]=$(( start[len] + H_COUNT[len] ))
+    done
+    for ((len = 1; len <= 15; len++)); do
+        at[len]=${start[len]}
+    done
+    for ((i = 0; i < n; i++)); do
+        len=${LEN[off + i]}
+        if [ "$len" -gt 0 ]; then
+            H_SYM[at[len]]=$i
+            at[len]=$(( at[len] + 1 ))
+        fi
+    done
+
+    for ((i = 0; i < 256; i++)); do
+        FAST[base + i]=-1
+    done
+    first=0
+    for ((len = 1; len <= 8; len++)); do
+        cnt=${H_COUNT[len]}
+        for ((i = 0; i < cnt; i++)); do
+            sym=${H_SYM[start[len] + i]}
+            code=$(( first + i ))
+            rev=0
+            for ((k = 0; k < len; k++)); do
+                rev=$(( (rev << 1) | ((code >> k) & 1) ))
+            done
+            for ((k = 0; k < (1 << (8 - len)); k++)); do
+                FAST[base + rev + (k << len)]=$(( (sym << 4) | len ))
+            done
+        done
+        first=$(( (first + cnt) << 1 ))
+    done
+}
+
+decode_cl() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${CL_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#CL_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${CL_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_lit() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${LC_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#LC_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${LC_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_dist() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[256 + peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${DC_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#DC_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${DC_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_block() {
+    local sym li lev len dsym dist k bi off peek ent
+    while :; do
+        if [ "$BP" -ge "$BLIMIT" ]; then
+            note "corrupt skin data (truncated stream)"
+            return 1
+        fi
+        bi=$(( BP >> 3 ))
+        off=$(( BP & 7 ))
+        peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+        ent=${FAST[peek]:--1}
+        if [ "$ent" -ge 0 ]; then
+            sym=$(( ent >> 4 ))
+            BP=$(( BP + (ent & 15) ))
+        else
+            decode_lit || { note "corrupt skin data (truncated stream)"; return 1; }
+            sym=$HSYM
+        fi
+        if [ "$sym" -lt 256 ]; then
+            OUT[OP]=$sym
+            OP=$(( OP + 1 ))
+            continue
+        fi
+        if [ "$sym" -eq 256 ]; then
+            return 0
+        fi
+        li=$(( sym - 257 ))
+        if [ "$li" -ge 29 ]; then
+            note "corrupt skin data (length code $sym)"
+            return 1
+        fi
+        len=${LEN_BASE[li]}
+        lev=${LEN_EXTRA[li]}
+        if [ "$lev" -gt 0 ]; then
+            getbits "$lev"
+            len=$(( len + GB ))
+        fi
+        decode_dist || { note "corrupt skin data (truncated stream)"; return 1; }
+        dsym=$HSYM
+        if [ "$dsym" -ge 30 ]; then
+            note "corrupt skin data (distance code $dsym)"
+            return 1
+        fi
+        dist=${DIST_BASE[dsym]}
+        lev=${DIST_EXTRA[dsym]}
+        if [ "$lev" -gt 0 ]; then
+            getbits "$lev"
+            dist=$(( dist + GB ))
+        fi
+        if [ "$dist" -gt "$OP" ]; then
+            note "corrupt skin data (bad distance)"
+            return 1
+        fi
+        for ((k = 0; k < len; k++)); do
+            OUT[OP]=${OUT[OP - dist]}
+            OP=$(( OP + 1 ))
+        done
+    done
+}
+
+inflate_zlib() {
+    local last=0 btype i k n len nlen hlit hdist hclen sym lev total idx
+    local aligned ip
+    BP=16
+    OP=0
+    LEN=()
+    BLIMIT=$(( (INN + 8) * 8 ))
+
+    while [ "$last" -eq 0 ]; do
+        getbits 1
+        last=$GB
+        getbits 2
+        btype=$GB
+        case $btype in
+            0)
+                aligned=$(( ((BP + 7) >> 3) << 3 ))
+                ip=$(( aligned >> 3 ))
+                len=$(( IN[ip] | (IN[ip + 1] << 8) ))
+                nlen=$(( IN[ip + 2] | (IN[ip + 3] << 8) ))
+                ip=$(( ip + 4 ))
+                if [ "$len" -ne $(( (~nlen) & 65535 )) ]; then
+                    note "corrupt skin data (stored block length)"
+                    return 1
+                fi
+                for ((k = 0; k < len; k++)); do
+                    OUT[OP]=$(( IN[ip] ))
+                    OP=$(( OP + 1 ))
+                    ip=$(( ip + 1 ))
+                done
+                BP=$(( ip << 3 ))
+                ;;
+            1)
+                LEN=()
+                for ((k = 0; k < 144; k++)); do LEN[k]=8; done
+                for ((k = 144; k < 256; k++)); do LEN[k]=9; done
+                for ((k = 256; k < 280; k++)); do LEN[k]=7; done
+                for ((k = 280; k < 288; k++)); do LEN[k]=8; done
+                build_huff 288 0 0
+                LC_COUNT=("${H_COUNT[@]}")
+                LC_SYM=("${H_SYM[@]}")
+                LEN=()
+                for ((k = 0; k < 32; k++)); do LEN[k]=5; done
+                build_huff 32 0 256
+                DC_COUNT=("${H_COUNT[@]}")
+                DC_SYM=("${H_SYM[@]}")
+                decode_block || return 1
+                ;;
+            2)
+                getbits 5
+                hlit=$(( GB + 257 ))
+                getbits 5
+                hdist=$(( GB + 1 ))
+                getbits 4
+                hclen=$(( GB + 4 ))
+                LEN=()
+                for ((k = 0; k < 19; k++)); do LEN[k]=0; done
+                for ((k = 0; k < hclen; k++)); do
+                    getbits 3
+                    LEN[CL_ORDER[k]]=$GB
+                done
+                build_huff 19 0 0
+                CL_COUNT=("${H_COUNT[@]}")
+                CL_SYM=("${H_SYM[@]}")
+                total=$(( hlit + hdist ))
+                LEN=()
+                idx=0
+                while [ "$idx" -lt "$total" ]; do
+                    decode_cl || { note "corrupt skin data (code lengths)"; return 1; }
+                    sym=$HSYM
+                    if [ "$sym" -lt 16 ]; then
+                        LEN[idx]=$sym
+                        idx=$(( idx + 1 ))
+                    elif [ "$sym" -eq 16 ]; then
+                        if [ "$idx" -eq 0 ]; then
+                            note "corrupt skin data (repeat)"
+                            return 1
+                        fi
+                        getbits 2
+                        n=$(( GB + 3 ))
+                        lev=${LEN[idx - 1]}
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=$lev
+                            idx=$(( idx + 1 ))
+                        done
+                    elif [ "$sym" -eq 17 ]; then
+                        getbits 3
+                        n=$(( GB + 3 ))
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=0
+                            idx=$(( idx + 1 ))
+                        done
+                    else
+                        getbits 7
+                        n=$(( GB + 11 ))
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=0
+                            idx=$(( idx + 1 ))
+                        done
+                    fi
+                done
+                build_huff "$hlit" 0 0
+                LC_COUNT=("${H_COUNT[@]}")
+                LC_SYM=("${H_SYM[@]}")
+                build_huff "$hdist" "$hlit" 256
+                DC_COUNT=("${H_COUNT[@]}")
+                DC_SYM=("${H_SYM[@]}")
+                decode_block || return 1
+                ;;
+            *)
+                note "corrupt skin data (block type $btype)"
+                return 1
+                ;;
+        esac
+        if [ "$OP" -gt 2000000 ]; then
+            note "skin data is implausibly large"
+            return 1
+        fi
+    done
+}
+
+LEN_BASE=(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258)
+LEN_EXTRA=(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0)
+DIST_BASE=(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289 16385 24577)
+DIST_EXTRA=(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13)
+CL_ORDER=(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15)
+
+decode_skin() {
+    local png=$1 i pos=0 len tag bytes
+    local -a PNG=()
+    local cp_depth=0 cp_type=0 cp_interlace=0
+    local stride
+
+    W=0
+    H=0
+    CH=4
+    IN=()
+    INN=0
+
+    bytes=$(wc -c < "$png")
+    if ! { mapfile -t PNG < <(od -v -An -tu1 -w1 "$png" 2>/dev/null | tr -d ' ') &&
+        [ "${#PNG[@]}" -eq "$bytes" ]; }; then
+        PNG=()
+        mapfile -t PNG < <(xxd -p -c 1 "$png" 2>/dev/null)
+        for i in "${!PNG[@]}"; do
+            PNG[i]=$((16#${PNG[i]}))
+        done
+    fi
+    if [ "${#PNG[@]}" -lt 8 ] ||
+        [ "${PNG[0]}" -ne 137 ] || [ "${PNG[1]}" -ne 80 ] ||
+        [ "${PNG[2]}" -ne 78 ] || [ "${PNG[3]}" -ne 71 ] ||
+        [ "${PNG[4]}" -ne 13 ] || [ "${PNG[5]}" -ne 10 ] ||
+        [ "${PNG[6]}" -ne 26 ] || [ "${PNG[7]}" -ne 10 ]; then
+        note "skin is not a PNG"
+        return 1
+    fi
+
+    pos=8
+    while [ $((pos + 8)) -le "${#PNG[@]}" ]; do
+        len=$(( (PNG[pos] << 24) | (PNG[pos + 1] << 16) | (PNG[pos + 2] << 8) | PNG[pos + 3] ))
+        if [ $(( pos + 12 + len )) -gt "${#PNG[@]}" ]; then
+            note "skin PNG is truncated"
+            return 1
+        fi
+        tag="${PNG[pos + 4]},${PNG[pos + 5]},${PNG[pos + 6]},${PNG[pos + 7]}"
+        case $tag in
+            73,72,68,82)
+                W=$(( (PNG[pos + 8] << 24) | (PNG[pos + 9] << 16) | (PNG[pos + 10] << 8) | PNG[pos + 11] ))
+                H=$(( (PNG[pos + 12] << 24) | (PNG[pos + 13] << 16) | (PNG[pos + 14] << 8) | PNG[pos + 15] ))
+                cp_depth=${PNG[pos + 16]}
+                cp_type=${PNG[pos + 17]}
+                cp_interlace=${PNG[pos + 20]}
+                ;;
+            73,68,65,84)
+                for ((i = 0; i < len; i++)); do
+                    IN[INN]=${PNG[pos + 8 + i]}
+                    INN=$(( INN + 1 ))
+                done
+                ;;
+            73,69,78,68)
+                break
+                ;;
+        esac
+        pos=$(( pos + 12 + len ))
+    done
+
+    if [ "$W" -eq 0 ] || [ "$H" -eq 0 ]; then
+        note "skin PNG has no readable header"
+        return 1
+    fi
+    if [ "$cp_depth" -ne 8 ]; then
+        note "unsupported skin PNG (bit depth $cp_depth)"
+        return 1
+    fi
+    if [ "$cp_type" -ne 6 ] && [ "$cp_type" -ne 2 ]; then
+        note "unsupported skin PNG (colour type $cp_type)"
+        return 1
+    fi
+    if [ "$cp_interlace" -ne 0 ]; then
+        note "interlaced skin PNGs are not supported"
+        return 1
+    fi
+    if [ "$INN" -eq 0 ]; then
+        note "skin PNG has no image data"
+        return 1
+    fi
+    if [ "$cp_type" -eq 2 ]; then
+        CH=3
+    fi
+
+    for ((i = 0; i < 16; i++)); do
+        IN[INN + i]=0
+    done
+
+    stride=$(( W * CH ))
+    if ! inflate_zlib; then
+        return 1
+    fi
+    if [ "$OP" -lt $(( (stride + 1) * H )) ]; then
+        note "skin data is truncated"
+        return 1
+    fi
+
+    local y x base off ft v a b c p pa pb pc pr
+    for ((y = 0; y < H; y++)); do
+        base=$(( y * stride ))
+        off=$(( y * (stride + 1) + 1 ))
+        ft=${OUT[y * (stride + 1)]}
+        case $ft in
+            0)
+                for ((x = 0; x < stride; x++)); do
+                    PIX[base + x]=${OUT[off + x]}
+                done
+                ;;
+            1)
+                for ((x = 0; x < CH && x < stride; x++)); do
+                    PIX[base + x]=${OUT[off + x]}
+                done
+                for ((x = CH; x < stride; x++)); do
+                    PIX[base + x]=$(( (${OUT[off + x]} + PIX[base + x - CH]) & 255 ))
+                done
+                ;;
+            2)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                else
+                    for ((x = 0; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base - stride + x]) & 255 ))
+                    done
+                fi
+                ;;
+            3)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + (PIX[base + x - CH] >> 1)) & 255 ))
+                    done
+                else
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + (PIX[base - stride + x] >> 1)) & 255 ))
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + ((PIX[base + x - CH] + PIX[base - stride + x]) >> 1)) & 255 ))
+                    done
+                fi
+                ;;
+            4)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base + x - CH]) & 255 ))
+                    done
+                else
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base - stride + x]) & 255 ))
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        v=${OUT[off + x]}
+                        a=${PIX[base + x - CH]}
+                        b=${PIX[base - stride + x]}
+                        c=${PIX[base - stride + x - CH]}
+                        p=$(( a + b - c ))
+                        pa=$(( p > a ? p - a : a - p ))
+                        pb=$(( p > b ? p - b : b - p ))
+                        pc=$(( p > c ? p - c : c - p ))
+                        if [ "$pa" -le "$pb" ] && [ "$pa" -le "$pc" ]; then
+                            pr=$a
+                        elif [ "$pb" -le "$pc" ]; then
+                            pr=$b
+                        else
+                            pr=$c
+                        fi
+                        PIX[base + x]=$(( (v + pr) & 255 ))
+                    done
+                fi
+                ;;
+            *)
+                note "corrupt skin PNG (filter $ft)"
+                return 1
+                ;;
+        esac
+    done
+}
+
+skin_px() {
+    local x=$1 y=$2 i
+
+    if [ "$x" -lt 0 ] || [ "$y" -lt 0 ] || [ "$x" -ge "$W" ] || [ "$y" -ge "$H" ]; then
+        PX_A=0
+        return
+    fi
+
+    i=$(( (y * W + x) * CH ))
+    PX_R=${PIX[i]}
+    PX_G=${PIX[i + 1]}
+    PX_B=${PIX[i + 2]}
+    if [ "$CH" -eq 4 ]; then
+        PX_A=${PIX[i + 3]}
+    else
+        PX_A=255
+    fi
+}
+
+face_px() {
+    local f=$1 u=$2 v=$3 bx by ox oy
+
+    case $f in
+        0) bx=8; by=8; ox=40; oy=8 ;;
+        1) bx=0; by=8; ox=32; oy=8 ;;
+        2) bx=8; by=0; ox=40; oy=0 ;;
+    esac
+
+    if [ "$H" -ge 64 ]; then
+        skin_px $(( ox + u )) $(( oy + v ))
+        if [ "$PX_A" -ge 128 ]; then
+            return
+        fi
+    fi
+
+    skin_px $(( bx + u )) $(( by + v ))
+}
+
+HEAD_LINES=()
+HEAD_W=0
+
+render_head() {
+    local png=$1
+    local -a PIX=()
+    decode_skin "$png" || return 1
+
+    local S=$scale d F D CW CHT i px py u v z x y sh r g b
+    d=$(( S / 2 ))
+    [ "$d" -lt 1 ] && d=1
+    F=$(( 8 * S ))
+    D=$(( 8 * d ))
+    CW=$(( F + D ))
+    CHT=$(( F + D ))
+    HEAD_W=$CW
+    HEAD_LINES=()
+
+    local -a OR=() OG=() OB=() OA=()
+    for ((py = 0; py < CHT; py++)); do
+        for ((px = 0; px < CW; px++)); do
+            i=$(( py * CW + px ))
+            OA[i]=0
+            if [ "$py" -ge "$D" ] && [ "$px" -lt "$F" ]; then
+                u=$(( px / S ))
+                v=$(( (py - D) / S ))
+                [ "$u" -gt 7 ] && u=7
+                [ "$v" -gt 7 ] && v=7
+                face_px 0 "$u" "$v"
+                sh=100
+            elif [ "$py" -lt $(( D - (px - F) )) ]; then
+                z=$(( (D - py) / d ))
+                [ "$z" -gt 7 ] && z=7
+                x=$(( (px - z * d) / S ))
+                if [ "$x" -lt 0 ] || [ "$x" -gt 7 ]; then
+                    continue
+                fi
+                face_px 2 "$x" "$(( 7 - z ))"
+                sh=118
+            else
+                z=$(( (px - F) / d ))
+                [ "$z" -gt 7 ] && z=7
+                y=$(( (py - D + z * d) / S ))
+                if [ "$y" -lt 0 ] || [ "$y" -gt 7 ]; then
+                    continue
+                fi
+                face_px 1 "$(( 7 - z ))" "$y"
+                sh=62
+            fi
+            if [ "$PX_A" -eq 0 ]; then
+                continue
+            fi
+            r=$(( PX_R * sh / 100 ))
+            g=$(( PX_G * sh / 100 ))
+            b=$(( PX_B * sh / 100 ))
+            [ "$r" -gt 255 ] && r=255
+            [ "$g" -gt 255 ] && g=255
+            [ "$b" -gt 255 ] && b=255
+            OR[i]=$r
+            OG[i]=$g
+            OB[i]=$b
+            OA[i]=255
+        done
+    done
+
+    local esc=$'\033' line ti bi ct cb
+    for ((py = 0; py < CHT; py += 2)); do
+        line=""
+        for ((px = 0; px < CW; px++)); do
+            ti=$(( py * CW + px ))
+            bi=$(( ti + CW ))
+            if [ "$color_mode" = true ]; then
+                if [ "${OA[ti]}" -gt 0 ] && [ "${OA[bi]}" -gt 0 ]; then
+                    line+="$esc[38;2;${OR[ti]};${OG[ti]};${OB[ti]}m$esc[48;2;${OR[bi]};${OG[bi]};${OB[bi]}m▀"
+                elif [ "${OA[ti]}" -gt 0 ]; then
+                    line+="$esc[49m$esc[38;2;${OR[ti]};${OG[ti]};${OB[ti]}m▀"
+                elif [ "${OA[bi]}" -gt 0 ]; then
+                    line+="$esc[49m$esc[38;2;${OR[bi]};${OG[bi]};${OB[bi]}m▄"
+                else
+                    line+="$esc[49m "
+                fi
+            else
+                if [ "${OA[ti]}" -gt 0 ] && [ "${OA[bi]}" -gt 0 ]; then
+                    to256 "${OR[ti]}" "${OG[ti]}" "${OB[ti]}"
+                    ct=$C256
+                    to256 "${OR[bi]}" "${OG[bi]}" "${OB[bi]}"
+                    cb=$C256
+                    line+="$esc[38;5;${ct}m$esc[48;5;${cb}m▀"
+                elif [ "${OA[ti]}" -gt 0 ]; then
+                    to256 "${OR[ti]}" "${OG[ti]}" "${OB[ti]}"
+                    line+="$esc[49m$esc[38;5;${C256}m▀"
+                elif [ "${OA[bi]}" -gt 0 ]; then
+                    to256 "${OR[bi]}" "${OG[bi]}" "${OB[bi]}"
+                    line+="$esc[49m$esc[38;5;${C256}m▄"
+                else
+                    line+="$esc[49m "
+                fi
+            fi
+        done
+        HEAD_LINES+=("$line$esc[0m")
+    done
+}
+
+fetch_forums() {
+    local url=$1 out=$2 attempt=1 code
+
+    while [ "$attempt" -le 3 ]; do
+        code=$(curl -sS --max-time 10 -A "$ua" -o "$out" -w '%{http_code}' "$url" 2>/dev/null) || code=000
+        if [ "$code" = 200 ]; then
+            printf '200' > "$out.code"
+            return 0
+        fi
+        if [ "$code" = 502 ] && [ "$attempt" -lt 3 ]; then
+            attempt=$(( attempt + 1 ))
+            sleep 1
+            continue
+        fi
+        printf '%s' "$code" > "$out.code"
+        return 1
+    done
+}
+
+declare -A FORUMS=()
+DSTATE=unknown
+
+parse_forums() {
+    local flat seg tok name pending= val key
+
+    FORUMS=()
+    flat=$(tr -d '\r\n' < "$1")
+
+    case $flat in
+        *'id="stats-content-duels"'*) seg=${flat#*'id="stats-content-duels"'} ;;
+        *'stats-content-duels'*) seg=${flat#*'stats-content-duels'} ;;
+        *) return 1 ;;
+    esac
+    seg=${seg%%'stats-content-'*}
+
+    pending=
+    while IFS= read -r tok; do
+        key=${tok%%>*}
+        val=${tok#*>}
+        val=${val#"${val%%[! ]*}"}
+        val=${val%"${val##*[! ]}"}
+        case $key in
+            statName*)
+                pending=$val
+                ;;
+            statValue*)
+                if [ -n "$pending" ]; then
+                    if [[ $val =~ ^[0-9,]+$ ]]; then
+                        val=${val//,/}
+                        if [ -z "${FORUMS[$pending]+x}" ]; then
+                            FORUMS[$pending]=$val
+                        fi
+                    fi
+                    pending=
+                fi
+                ;;
+        esac
+    done < <(grep -oE 'stat(Name|Value)[^>]{0,160}>[^<]{0,160}' <<<"$seg")
+
+    ban_status
+}
+
+ban_status() {
+    local wins=${FORUMS[Wins]:-0} name mode i n played=0 wiped=0 single=0 ws w
+    local -a modes=() mode_wins=() mode_ws=()
+
+    DSTATE=no
+    if [ "$wins" -le 2 ]; then
+        return
+    fi
+
+    for name in "${!FORUMS[@]}"; do
+        if [[ $name =~ ^Best\ (.+)\ Winstreak$ ]]; then
+            mode=${BASH_REMATCH[1]}
+            [ "$mode" = 'TNT Games' ] && continue
+            modes+=("$mode")
+            mode_ws+=("${FORUMS[$name]}")
+            mode_wins+=("${FORUMS["$mode Wins"]:-0}")
+        fi
+    done
+
+    n=${#modes[@]}
+    if [ "$n" -eq 0 ]; then
+        return
+    fi
+
+    for ((i = 0; i < n; i++)); do
+        w=${mode_wins[i]}
+        if [ "$w" -gt 0 ]; then
+            played=$(( played + 1 ))
+            single=$w
+            if [ "${mode_ws[i]}" -eq 0 ]; then
+                wiped=$(( wiped + 1 ))
+            fi
+        fi
+    done
+
+    if [ "$played" -eq 0 ]; then
+        DSTATE=yes
+        for ((i = 0; i < n; i++)); do
+            if [ "${mode_ws[i]}" -ne 0 ]; then
+                DSTATE=no
+            fi
+        done
+        return
+    fi
+
+    if [ "$played" -eq 1 ]; then
+        if [ "$wiped" -eq 1 ] && [ "$single" -ge 25 ]; then
+            DSTATE=yes
+        else
+            DSTATE=no
+        fi
+        return
+    fi
+
+    if [ $(( wiped * 4 )) -gt $(( played * 3 )) ]; then
+        DSTATE=yes
+    else
+        DSTATE=no
+    fi
+}
+
+api_err=""
+api_ok=0
+bw_xp=0 bw_wins=0 bw_losses=0 bw_fk=0 bw_fd=0 bw_beds=0 bw_ws=0
+sw_wins=0 sw_losses=0 sw_kills=0 sw_deaths=0
+du_wins=0 du_losses=0 du_kills=0 du_deaths=0 du_ws=0 du_best=0
+
+read_api() {
+    local body ok line rank_line rk_rank rk_new rk_monthly rk_plus rk_prefix rk_pkg
+
+    body=$(cat "$1")
+    ok=$(jq -r 'if .success == true then "yes" else "no" end' <<<"$body" 2>/dev/null) || ok=no
+
+    if [ "$ok" != yes ]; then
+        api_err=$(jq -r '.cause // .error // "request failed"' <<<"$body" 2>/dev/null) || api_err="request failed"
+        [ -n "$api_err" ] || api_err="request failed"
+        return 1
+    fi
+
+    if [ "$(jq -r '.player == null' <<<"$body" 2>/dev/null)" != false ]; then
+        api_err="no such player"
+        return 1
+    fi
+
+    line=$(jq -r '
+        (.player.stats // {}) as $s |
+        ($s.Bedwars // {}) as $b |
+        ($s.SkyWars // {}) as $w |
+        ($s.Duels // {}) as $d |
+        [
+            ($b.Experience // 0),
+            ($b.wins_bedwars // $b.wins // 0),
+            ($b.losses_bedwars // $b.losses // 0),
+            ($b.final_kills_bedwars // 0),
+            ($b.final_deaths_bedwars // 0),
+            ($b.beds_broken_bedwars // 0),
+            ($b.winstreak // 0),
+            ($w.wins // 0),
+            ($w.losses // 0),
+            ($w.kills // 0),
+            ($w.deaths // 0),
+            ($d.wins // 0),
+            ($d.losses // 0),
+            ($d.kills // 0),
+            ($d.deaths // 0),
+            ($d.current_winstreak // 0),
+            ($d.best_overall_winstreak // $d.best_winstreak // 0)
+        ] | map((tonumber? // 0) | floor) | map(tostring) | join("\u001f")
+    ' <<<"$body" 2>/dev/null) || line=""
+
+    if [ -z "$line" ]; then
+        api_err="unreadable API response"
+        return 1
+    fi
+
+    IFS=$'\x1f' read -r bw_xp bw_wins bw_losses bw_fk bw_fd bw_beds bw_ws \
+        sw_wins sw_losses sw_kills sw_deaths \
+        du_wins du_losses du_kills du_deaths du_ws du_best <<<"$line"
+
+    bw_xp=${bw_xp:-0}
+    bw_wins=${bw_wins:-0}
+    bw_losses=${bw_losses:-0}
+    bw_fk=${bw_fk:-0}
+    bw_fd=${bw_fd:-0}
+    bw_beds=${bw_beds:-0}
+    bw_ws=${bw_ws:-0}
+    sw_wins=${sw_wins:-0}
+    sw_losses=${sw_losses:-0}
+    sw_kills=${sw_kills:-0}
+    sw_deaths=${sw_deaths:-0}
+    du_wins=${du_wins:-0}
+    du_losses=${du_losses:-0}
+    du_kills=${du_kills:-0}
+    du_deaths=${du_deaths:-0}
+    du_ws=${du_ws:-0}
+    du_best=${du_best:-0}
+
+    rank_line=$(jq -r '[
+        (.player.rank // ""),
+        (.player.newPackageRank // ""),
+        (.player.monthlyPackageRank // ""),
+        (.player.rankPlusColor // ""),
+        (.player.prefix // ""),
+        (.player.packageRank // "")
+    ] | map(tostring) | join("\u001f")' "$1" 2>/dev/null) || rank_line=""
+
+    IFS=$'\x1f' read -r rk_rank rk_new rk_monthly rk_plus rk_prefix rk_pkg <<<"$rank_line" || true
+
+    build_rank "${rk_prefix:-}" "${rk_rank:-}" "${rk_new:-}" "${rk_monthly:-}" "${rk_plus:-}" "${rk_pkg:-}"
+
+    api_ok=1
+}
+
+mode=lookup
+key_val=
+cube_val=
+cube_nick=
+cube_rm=
+player=
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --key|--hypixel-key)
+            mode=key
+            [ "$#" -ge 2 ] || usage
+            key_val=$2
+            shift 2
+            ;;
+        --cubelify|--cubelify-url)
+            mode=cubelify
+            [ "$#" -ge 2 ] || usage
+            cube_val=$2
+            shift 2
+            if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+                cube_nick=$1
+                shift
+            fi
+            ;;
+        --cubelify-remove|--remove-cubelify)
+            mode=cubelify_remove
+            [ "$#" -ge 2 ] || usage
+            cube_rm=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf '%s: unknown option %s\n' "$prog" "$1" >&2
+            usage
+            ;;
+        *)
+            player=$1
+            shift
+            ;;
+    esac
+done
+
+need_jq
+ensure_config
+
+if [ "$mode" = key ]; then
+    [ -n "$key_val" ] || die "empty API key"
+    tmp=$(mktemp)
+    jq --arg k "$key_val" '.["hypixel_key"] = $k' "$cfg_file" > "$tmp"
+    mv "$tmp" "$cfg_file"
+    printf 'saved hypixel api key\n'
+    exit 0
+fi
+
+if [ "$mode" = cubelify ]; then
+    case $cube_val in
+        http://*|https://*) ;;
+        *) die "invalid URL: $cube_val" ;;
+    esac
+    tmp=$(mktemp)
+    jq --arg u "$cube_val" --arg n "$cube_nick" '
+        .cubelify = (
+            (.cubelify // []) as $c
+            | (if ($c | type) == "string" then [$c] else $c end)
+            | map(if type == "string" then {url: .} else . end)
+            | map(select(.url != $u))
+            | map(select($n == "" or ((.name // "") != $n)))
+            | . + [if $n == "" then {url: $u} else {name: $n, url: $u} end]
+            | sort_by((.name // "") + " " + .url)
+        )' "$cfg_file" > "$tmp"
+    mv "$tmp" "$cfg_file"
+    printf 'saved %s\n' "${cube_nick:-$cube_val}"
+    exit 0
+fi
+
+if [ "$mode" = cubelify_remove ]; then
+    found=$(jq -r --arg t "$cube_rm" '
+        (.cubelify // [])
+        | (if type == "string" then [.] else . end)
+        | map(if type == "string" then {url: .} else . end)
+        | map(select(.url == $t or ((.name // "") == $t)))
+        | length' "$cfg_file")
+    [ "${found:-0}" -gt 0 ] || die "no such entry: $cube_rm"
+    tmp=$(mktemp)
+    jq --arg t "$cube_rm" '
+        .cubelify = (
+            (.cubelify // [])
+            | (if type == "string" then [.] else . end)
+            | map(if type == "string" then {url: .} else . end)
+            | map(select(.url != $t and ((.name // "") != $t)))
+        )' "$cfg_file" > "$tmp"
+    mv "$tmp" "$cfg_file"
+    printf 'removed %s\n' "$cube_rm"
+    exit 0
+fi
+
+[ -n "$player" ] || usage
+[ "$#" -eq 0 ] || usage
+
+api_key=$(jq -r '.["hypixel_key"] // empty' "$cfg_file")
+
+case $scale in
+    [1-9]) ;;
+    [1-9][0-9]) ;;
+    *) scale=3 ;;
+esac
+if [ "$scale" -gt 8 ]; then
+    scale=8
+fi
+
+uuid_re='^([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+name_re='^[A-Za-z0-9_]{1,16}$'
+
+if [[ $player =~ $uuid_re ]]; then
+    bare=${player//-/}
+    lookup_url="https://sessionserver.mojang.com/session/minecraft/profile/${bare,,}"
+elif [[ $player =~ $name_re ]]; then
+    lookup_url="https://api.mojang.com/users/profiles/minecraft/$player"
+else
+    die "not a valid username or UUID: $player"
+fi
+
+resp=$(curl -sS --max-time 15 -w '\n%{http_code}' "$lookup_url" 2>/dev/null) || {
+    status=$?
+    [ "$status" -eq 28 ] && die "timed out talking to the Mojang API"
+    die "could not reach the Mojang API (curl exit $status)"
+}
+http=${resp##*$'\n'}
+body=${resp%$'\n'*}
+case $http in
+    200) ;;
+    204|404) die "no profile found for '$player'" ;;
+    429) die "Mojang is rate limiting requests; try again shortly" ;;
+    *) die "lookup failed for '$player' (HTTP $http)" ;;
+esac
+
+id=$(jq -r '.id // empty' <<<"$body" 2>/dev/null || true)
+name=$(jq -r '.name // empty' <<<"$body" 2>/dev/null || true)
+[ -n "$id" ] && [ -n "$name" ] || die "no profile found for '$player'"
+
+uuid=$(printf '%s' "$id" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')
+
+cube_labels=()
+cube_targets=()
+while IFS=$'\x1f' read -r c_name c_url; do
+    [ -n "$c_url" ] || continue
+    c_target=${c_url//\{\{id\}\}/$uuid}
+    c_target=${c_target//\{\{name\}\}/$name}
+    if [ -z "$c_name" ]; then
+        c_name=${c_target#*://}
+        c_name=${c_name%%/*}
+    fi
+    cube_labels+=("$c_name")
+    cube_targets+=("$c_target")
+done < <(jq -r '
+    (.cubelify // [])
+    | (if type == "string" then [.] else . end)
+    | .[]
+    | (if type == "string" then {url: .} else . end)
+    | [(.name // ""), (.url // "")] | join("\u001f")
+' "$cfg_file")
+
+tmpd=$(mktemp -d)
+trap 'rm -rf "$tmpd"' EXIT
+
+(
+    code=$(curl -sS --max-time 15 -A "$ua" -o "$tmpd/profile.json" -w '%{http_code}' \
+        "https://sessionserver.mojang.com/session/minecraft/profile/${id}" 2>/dev/null) || code=000
+    printf '%s' "$code" > "$tmpd/profile.code"
+) &
+
+if [ -n "$api_key" ]; then
+    (
+        code=$(curl -sS --max-time 20 -A "$ua" -H "API-Key: $api_key" -o "$tmpd/hypixel.json" \
+            -w '%{http_code}' "https://api.hypixel.net/v2/player?uuid=$uuid" 2>/dev/null) || code=000
+        printf '%s' "$code" > "$tmpd/hypixel.code"
+    ) &
+fi
+
+if [ "${#cube_targets[@]}" -gt 0 ]; then
+    for ((ci = 0; ci < ${#cube_targets[@]}; ci++)); do
+        (
+            code=$(curl -sS --max-time 20 -A "$ua" -o "$tmpd/cube$ci.json" -w '%{http_code}' \
+                "${cube_targets[ci]}" 2>/dev/null) || code=000
+            printf '%s' "$code" > "$tmpd/cube$ci.code"
+        ) &
+    done
+fi
+
+(
+    fetch_forums "$forums_base/$name" "$tmpd/forums" || true
+) &
+
+wait || true
+
+if [ -n "$api_key" ]; then
+    if [ "$(cat "$tmpd/hypixel.code" 2>/dev/null)" = 200 ]; then
+        read_api "$tmpd/hypixel.json" || true
+    else
+        api_err="hypixel api unreachable (HTTP $(cat "$tmpd/hypixel.code" 2>/dev/null))"
+    fi
+fi
+
+if [ "$(cat "$tmpd/forums.code" 2>/dev/null)" = 200 ]; then
+    parse_forums "$tmpd/forums" || DSTATE=unknown
+else
+    DSTATE=unknown
+fi
+
+skin_url=""
+if [ "$(cat "$tmpd/profile.code" 2>/dev/null)" = 200 ]; then
+    b64=$(jq -r '.properties[]? | select(.name == "textures") | .value' "$tmpd/profile.json" 2>/dev/null | head -n1 || true)
+    if [ -n "$b64" ]; then
+        tex_json=$(printf '%s' "$b64" | base64 -d 2>/dev/null | tr -d '\r\n' || true)
+        skin_url=$(printf '%s' "$tex_json" |
+            sed -n 's|.*"SKIN"[[:space:]]*:[[:space:]]*{[^}]*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' |
+            sed 's|^http://|https://|')
+    fi
+fi
+
+if [ -n "$skin_url" ]; then
+    if curl -fsS --max-time 20 -o "$tmpd/skin.png" "$skin_url" 2>/dev/null; then
+        render_head "$tmpd/skin.png" || true
+    else
+        note "could not download the skin"
+    fi
+fi
+
+TEXT=()
+
+TEXT+=("${RANK_TAG}$(bold "$(paint "$C_NAME" "$name")")")
+TEXT+=("$(paint "$C_UUID" "$uuid")")
+TEXT+=("")
+
+TEXT+=("$(hdr "$C_HDR" blacklists)")
+if [ "${#cube_targets[@]}" -eq 0 ]; then
+    TEXT+=("  $(paint "$C_DIM" "none set")  $(paint "$C_DIM" "--cubelify <url> [name]")")
+else
+    for ((ci = 0; ci < ${#cube_targets[@]}; ci++)); do
+        cube_label=${cube_labels[ci]}
+        cube_code=$(cat "$tmpd/cube$ci.code" 2>/dev/null)
+        if [ "$cube_code" != 200 ]; then
+            TEXT+=("  $(chip "$cube_label" "HTTP $cube_code" "$C_BAD")")
+            continue
+        fi
+        cube_score=$(jq -r '(.score.value // empty) | tonumber? // empty | floor' "$tmpd/cube$ci.json" 2>/dev/null) || cube_score=
+        cube_tags=$(jq -r '.tags | length' "$tmpd/cube$ci.json" 2>/dev/null) || cube_tags=0
+        cube_tags=${cube_tags:-0}
+        if [ -z "$cube_score" ]; then
+            TEXT+=("  $(chip "$cube_label" "unreadable" "$C_BAD")")
+            continue
+        fi
+        if [ "$cube_score" -ge 50 ]; then
+            score_color=$C_BAD
+        elif [ "$cube_score" -ge 15 ]; then
+            score_color=$C_WARN
+        else
+            score_color=$C_GOOD
+        fi
+        TEXT+=("  $(chip "$cube_label" "score $cube_score" "$score_color")   $(chip tags "$cube_tags")")
+        if [ "$cube_tags" -eq 0 ]; then
+            TEXT+=("    $(paint "$C_GOOD" "no tags")")
+        else
+            shown=0
+            while IFS=$'\x1f' read -r tag_color tag_text; do
+                [ -n "$tag_text" ] || continue
+                shown=$(( shown + 1 ))
+                if [ "$shown" -gt 4 ]; then
+                    TEXT+=("    $(paint "$C_DIM" "… $(( cube_tags - 4 )) more")")
+                    break
+                fi
+                if ! [ "${tag_color:-0}" -gt 0 ] 2>/dev/null; then
+                    tag_color=$C_LABEL
+                fi
+                tag_text=${tag_text//$'\x1e'/$'\n'}
+                first=1
+                while IFS= read -r tag_line; do
+                    [ -n "$tag_line" ] || continue
+                    if [ "$first" -eq 1 ]; then
+                        TEXT+=("    $(paint "$tag_color" '•') $(paint "$tag_color" "$tag_line")")
+                        first=0
+                    else
+                        TEXT+=("      $(paint "$tag_color" "$tag_line")")
+                    fi
+                done <<<"$tag_text"
+            done < <(jq -r '.tags[]? | [(((.color // 0) | tonumber? // 0) | floor), ((.tooltip // "") | gsub("\n"; "\u001e"))] | join("\u001f")' \
+                "$tmpd/cube$ci.json" 2>/dev/null)
+        fi
+    done
+fi
+
+TEXT+=("")
+
+if [ -z "$api_key" ]; then
+    TEXT+=("$(hdr "$C_HDR" hypixel)")
+    TEXT+=("  $(paint "$C_DIM" "no api key set")  $(paint "$C_DIM" "--key <key>")")
+elif [ "$api_ok" -eq 0 ]; then
+    TEXT+=("$(hdr "$C_HDR" hypixel)")
+    TEXT+=("  $(paint "$C_BAD" "$api_err")")
+else
+    TEXT+=("$(hdr "$C_BW" bedwars)  $(paint "$C_BW" "★ $(bw_level "$bw_xp")")")
+    TEXT+=("  $(chip wins "$(commas "$bw_wins")")   $(chip losses "$(commas "$bw_losses")")   $(chip wlr "$(ratio "$bw_wins" "$bw_losses")")")
+    TEXT+=("  $(chip 'final kills' "$(commas "$bw_fk")")   $(chip 'final deaths' "$(commas "$bw_fd")")   $(chip fkdr "$(ratio "$bw_fk" "$bw_fd")")")
+    TEXT+=("  $(chip beds "$(commas "$bw_beds")")   $(chip winstreak "$(commas "$bw_ws")")")
+    TEXT+=("")
+
+    TEXT+=("$(hdr "$C_SW" skywars)")
+    TEXT+=("  $(chip wins "$(commas "$sw_wins")")   $(chip losses "$(commas "$sw_losses")")   $(chip wlr "$(ratio "$sw_wins" "$sw_losses")")")
+    TEXT+=("  $(chip kills "$(commas "$sw_kills")")   $(chip deaths "$(commas "$sw_deaths")")   $(chip kdr "$(ratio "$sw_kills" "$sw_deaths")")")
+    TEXT+=("")
+
+    TEXT+=("$(hdr "$C_DUEL" duels)")
+    TEXT+=("  $(chip wins "$(commas "$du_wins")")   $(chip losses "$(commas "$du_losses")")   $(chip wlr "$(ratio "$du_wins" "$du_losses")")")
+    TEXT+=("  $(chip kills "$(commas "$du_kills")")   $(chip deaths "$(commas "$du_deaths")")   $(chip kdr "$(ratio "$du_kills" "$du_deaths")")")
+    TEXT+=("  $(chip winstreak "$(commas "$du_ws")")   $(chip best "$(commas "$du_best")")")
+    TEXT+=("")
+fi
+
+case $DSTATE in
+    yes) TEXT+=("$(hdr "$C_BAD" banned)  $(paint "$C_BAD" yes)") ;;
+    no) TEXT+=("$(hdr "$C_GOOD" banned)  $(paint "$C_GOOD" no)") ;;
+    *) TEXT+=("$(hdr "$C_WARN" banned)  $(paint "$C_WARN" unknown)") ;;
+esac
+
+total=${#HEAD_LINES[@]}
+[ "${#TEXT[@]}" -gt "$total" ] && total=${#TEXT[@]}
+
+if [ "$total" -eq 0 ]; then
+    exit 1
+fi
+
+if [ "${#HEAD_LINES[@]}" -eq 0 ]; then
+    for line in "${TEXT[@]}"; do
+        printf '%s\n' "$line"
+    done
+    exit 0
+fi
+
+for ((i = 0; i < total; i++)); do
+    if [ "$i" -lt "${#HEAD_LINES[@]}" ]; then
+        printf '%s' "${HEAD_LINES[i]}"
+    else
+        printf '%*s' "$HEAD_W" ''
+    fi
+    if [ "$i" -lt "${#TEXT[@]}" ]; then
+        printf '  %s\n' "${TEXT[i]}"
+    else
+        printf '\n'
+    fi
+done
