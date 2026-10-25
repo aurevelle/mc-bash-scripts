@@ -44,7 +44,7 @@ note() {
 
 usage() {
     cat >&2 <<EOF
-Usage: $prog <username|uuid>
+Usage: $prog [--view-hidden] <username|uuid>
        $prog --key <hypixel-api-key>
        $prog --cubelify <url> [name]
        $prog --cubelify-remove <url|name>
@@ -1257,6 +1257,7 @@ key_val=
 cube_val=
 cube_nick=
 cube_rm=
+view_hidden=0
 player=
 
 while [ "$#" -gt 0 ]; do
@@ -1282,6 +1283,10 @@ while [ "$#" -gt 0 ]; do
             [ "$#" -ge 2 ] || usage
             cube_rm=$2
             shift 2
+            ;;
+        --view-hidden)
+            view_hidden=1
+            shift
             ;;
         -h|--help)
             usage
@@ -1407,6 +1412,18 @@ while IFS=$'\x1f' read -r c_name c_url; do
     [ -n "$c_url" ] || continue
     c_target=${c_url//\{\{id\}\}/$uuid}
     c_target=${c_target//\{\{name\}\}/$name}
+    if [ "$view_hidden" -eq 1 ]; then
+        case $c_url in
+            *api.urchin.gg*)
+                c_target=$(printf '%s' "$c_target" | sed -E 's/([?&])reveal_hidden=[^&]*//')
+                c_target=${c_target%[?&]}
+                case $c_target in
+                    *\?*) c_target="$c_target&reveal_hidden=true" ;;
+                    *) c_target="$c_target?reveal_hidden=true" ;;
+                esac
+                ;;
+        esac
+    fi
     if [ -z "$c_name" ]; then
         c_name=${c_target#*://}
         c_name=${c_name%%/*}
@@ -1453,6 +1470,33 @@ fi
 ) &
 
 wait || true
+
+cube_reveal=()
+for ((ci = 0; ci < ${#cube_targets[@]}; ci++)); do
+    cube_reveal[$ci]=""
+    case ${cube_targets[ci]} in
+        *api.urchin.gg*) ;;
+        *) continue ;;
+    esac
+    [ "$(cat "$tmpd/cube$ci.code" 2>/dev/null)" = 200 ] || continue
+    hidden=$(jq -r '[.tags[]? | select(((.tooltip // "") | test("Added [^)]*\\)")) and ((.tooltip // "") | test("Added by ") | not))] | length' \
+        "$tmpd/cube$ci.json" 2>/dev/null) || hidden=0
+    [ "${hidden:-0}" -gt 0 ] 2>/dev/null || continue
+    reveal_url=$(printf '%s' "${cube_targets[ci]}" | sed 's|/cubelify|/player/tags|')
+    reveal_url=$(printf '%s' "$reveal_url" | sed -E 's/([?&])reveal_hidden=[^&]*//')
+    reveal_url=${reveal_url%[?&]}
+    case $reveal_url in
+        *\?*) reveal_url="$reveal_url&reveal_hidden=true" ;;
+        *) reveal_url="$reveal_url?reveal_hidden=true" ;;
+    esac
+    code=$(curl -sS --max-time 20 -A "$ua" -o "$tmpd/reveal$ci.json" -w '%{http_code}' \
+        "$reveal_url" 2>/dev/null) || code=000
+    [ "$code" = 200 ] || continue
+    jq -r '.tags[]? | select((.added_by_username // "") != "") |
+        [((.tag_type // "") | gsub("_"; " ") | ascii_downcase | split(" ") | map((.[0:1] | ascii_upcase) + .[1:]) | join(" ")), .added_by_username] |
+        join("\u001f")' "$tmpd/reveal$ci.json" >"$tmpd/reveal$ci.tsv" 2>/dev/null || true
+    [ -s "$tmpd/reveal$ci.tsv" ] && cube_reveal[$ci]="$tmpd/reveal$ci.tsv"
+done
 
 if [ -n "$api_key" ]; then
     if [ "$(cat "$tmpd/hypixel.code" 2>/dev/null)" = 200 ]; then
@@ -1534,6 +1578,26 @@ else
                     tag_color=$C_LABEL
                 fi
                 tag_text=${tag_text//$'\x1e'/$'\n'}
+                if [ -n "${cube_reveal[$ci]:-}" ] && [ -f "${cube_reveal[$ci]}" ]; then
+                    tag_head=${tag_text%%$'\n'*}
+                    tag_rest=""
+                    [ "$tag_head" = "$tag_text" ] || tag_rest=${tag_text#*$'\n'}
+                    while IFS=$'\x1f' read -r rv_title rv_user; do
+                        [ -n "$rv_title" ] && [ -n "$rv_user" ] || continue
+                        case $tag_head in
+                            *"Added by "*) break ;;
+                            *"$rv_title"*) ;;
+                            *) continue ;;
+                        esac
+                        tag_head=$(printf '%s' "$tag_head" | sed -E "s/\\(Added ([^)]*)\\)/(Added by $rv_user \\1)/")
+                        break
+                    done <"${cube_reveal[$ci]}"
+                    if [ -n "$tag_rest" ]; then
+                        tag_text="$tag_head"$'\n'"$tag_rest"
+                    else
+                        tag_text=$tag_head
+                    fi
+                fi
                 first=1
                 while IFS= read -r tag_line; do
                     [ -n "$tag_line" ] || continue
