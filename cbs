@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prog=${0##*/}
+root=$(cd -- "$(dirname -- "$0")" && pwd)
+data_dir=$root/data
+data_file=$data_dir/cubelify.json
+mdi_file=$data_dir/mdi.css
+mdi_url=https://cdn.jsdelivr.net/npm/@mdi/font@latest/css/materialdesignicons.min.css
+
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ] && [ "${TERM:-dumb}" != dumb ]; then
+    color_on=1
+else
+    color_on=0
+fi
+
+case ${COLORTERM:-} in
+    *truecolor*|*24bit*) color_mode=true ;;
+    *) color_mode=256 ;;
+esac
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
+usage() {
+    cat >&2 <<'EOF'
+Usage: cbs.sh <username|uuid>
+       cbs.sh --set <URL> [nickname]
+       cbs.sh --remove <URL|nickname>
+EOF
+exit 2
+}
+
+need_jq() {
+    command -v jq >/dev/null 2>&1 || die "jq is required"
+}
+
+ensure_data() {
+    mkdir -p "$data_dir"
+    if [ ! -f "$data_file" ]; then
+        printf '[]\n' > "$data_file"
+    fi
+    jq -e 'type == "array"' "$data_file" >/dev/null 2>&1 ||
+        die "$data_file is not a JSON array"
+}
+
+ensure_mdi() {
+    [ -s "$mdi_file" ] && return 0
+    mkdir -p "$data_dir"
+    if curl -fsS --max-time 30 -o "$mdi_file.tmp" "$mdi_url" 2>/dev/null; then
+        mv "$mdi_file.tmp" "$mdi_file"
+        return 0
+    fi
+    rm -f "$mdi_file.tmp"
+    return 1
+}
+
+glyph_for() {
+    local icon=$1 cp esc
+    [ -n "$icon" ] || return 1
+    case $icon in
+        *[!A-Za-z0-9-]*) return 1 ;;
+    esac
+    ensure_mdi || return 1
+    cp=$(grep -o -m1 "\.$icon::before{content:\"[^\"]*\"}" "$mdi_file" |
+        sed 's/.*\\//; s/"}$//')
+    [ -n "$cp" ] || return 1
+    printf -v esc '\\U%08X' "$((16#$cp))"
+    printf '%b' "$esc"
+}
+
+to256() {
+    local r=$1 g=$2 b=$3 avg idx
+    idx() {
+        [ "$1" -lt 48 ] && { echo 0; return; }
+        [ "$1" -gt 238 ] && { echo 5; return; }
+        echo $(( ($1 - 35) / 40 ))
+    }
+if [ "$(( (r > g ? r - g : g - r) ))" -lt 10 ] &&
+    [ "$(( (g > b ? g - b : b - g) ))" -lt 10 ]; then
+avg=$(( (r + g + b) / 3 ))
+if [ "$avg" -lt 8 ]; then
+    echo 16
+elif [ "$avg" -gt 238 ]; then
+    echo 231
+else
+    echo $(( 232 + (avg - 8) / 10 ))
+fi
+return
+fi
+echo $(( 16 + 36 * $(idx "$r") + 6 * $(idx "$g") + $(idx "$b") ))
+}
+
+paint() {
+    local rgb=$1 text=$2 r g b
+    if [ "$color_on" -eq 0 ] || [ "$rgb" -le 0 ]; then
+        printf '%s' "$text"
+        return
+    fi
+    r=$(( (rgb >> 16) & 255 ))
+    g=$(( (rgb >> 8) & 255 ))
+    b=$(( rgb & 255 ))
+    if [ "$color_mode" = true ]; then
+        printf '\033[38;2;%d;%d;%dm%s\033[0m' "$r" "$g" "$b" "$text"
+    else
+        printf '\033[38;5;%dm%s\033[0m' "$(to256 "$r" "$g" "$b")" "$text"
+    fi
+}
+
+print_tag() {
+    local icon=$1 tooltip=$2 color=$3 glyph first=1 line
+    if [ -n "$icon" ]; then
+        glyph=$(glyph_for "$icon") || glyph=":${icon}:"
+    else
+        glyph=$(printf '\u2022')
+    fi
+    while IFS= read -r line; do
+        if [ "$first" -eq 1 ]; then
+            printf '  %s %s\n' "$(paint "$color" "$glyph")" "$line"
+            first=0
+        else
+            printf '    %s\n' "$line"
+        fi
+    done <<< "$tooltip"
+}
+
+mode=lookup
+set_url=
+set_nick=
+remove_target=
+player=
+
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --set)
+            mode=set
+            [ "$#" -ge 2 ] || usage
+            set_url=$2
+            shift 2
+            if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+                set_nick=$1
+                shift
+            fi
+            ;;
+        --remove)
+            mode=remove
+            [ "$#" -ge 2 ] || usage
+            remove_target=$2
+            shift 2
+            ;;
+        -h|--help)
+            usage
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            printf '%s: unknown option %s\n' "$prog" "$1" >&2
+            usage
+            ;;
+        *)
+            player=$1
+            shift
+            ;;
+    esac
+done
+
+need_jq
+ensure_data
+
+if [ "$mode" = set ]; then
+    case $set_url in
+        http://*|https://*) ;;
+        *) die "invalid URL: $set_url" ;;
+    esac
+    tmp=$(mktemp)
+    jq --arg u "$set_url" --arg n "$set_nick" '
+    map(select(.url != $u))
+    | map(select($n == "" or ((.name // "") != $n)))
+    | . + [ if $n == "" then {url: $u} else {name: $n, url: $u} end ]
+    | sort_by((.name // "") + " " + .url)
+    ' "$data_file" > "$tmp"
+    mv "$tmp" "$data_file"
+    printf 'saved %s\n' "${set_nick:-$set_url}"
+    exit 0
+fi
+
+if [ "$mode" = remove ]; then
+    before=$(jq 'length' "$data_file")
+    tmp=$(mktemp)
+    jq --arg t "$remove_target" '
+    map(select(.url != $t and ((.name // "") != $t)))
+    ' "$data_file" > "$tmp"
+    after=$(jq 'length' "$tmp")
+    if [ "$before" = "$after" ]; then
+        rm -f "$tmp"
+        die "no such entry: $remove_target"
+    fi
+    mv "$tmp" "$data_file"
+    printf 'removed %s\n' "$remove_target"
+    exit 0
+fi
+
+[ -n "$player" ] || usage
+[ "$#" -eq 0 ] || usage
+
+uuid_re='^([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+name_re='^[A-Za-z0-9_]{1,16}$'
+
+if [[ $player =~ $uuid_re ]]; then
+    bare=${player//-/}
+    lookup_url="https://sessionserver.mojang.com/session/minecraft/profile/${bare,,}"
+elif [[ $player =~ $name_re ]]; then
+    lookup_url="https://api.mojang.com/users/profiles/minecraft/$player"
+else
+    die "not a valid username or UUID: $player"
+fi
+
+resp=$(curl -sS --max-time 15 -w '\n%{http_code}' "$lookup_url" 2>/dev/null) || {
+    status=$?
+    [ "$status" -eq 28 ] && die "timed out talking to the Mojang API"
+    die "could not reach the Mojang API (curl exit $status)"
+}
+http=${resp##*$'\n'}
+body=${resp%$'\n'*}
+case $http in
+    200) ;;
+    204|404) die "no profile found for '$player'" ;;
+    429) die "Mojang is rate limiting requests; try again shortly" ;;
+    *) die "lookup failed for '$player' (HTTP $http)" ;;
+esac
+
+id=$(jq -r '.id // empty' <<<"$body" 2>/dev/null || true)
+name=$(jq -r '.name // empty' <<<"$body" 2>/dev/null || true)
+[ -n "$id" ] && [ -n "$name" ] || die "no profile found for '$player'"
+
+uuid=$(printf '%s' "$id" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')
+
+printf '%s (%s)\n' "$name" "$uuid"
+
+count=$(jq 'length' "$data_file")
+if [ "$count" -eq 0 ]; then
+    printf 'no endpoints configured; use --set <URL> [nickname]\n' >&2
+    exit 0
+fi
+
+jq -r '.[] | [(.name // ""), .url] | join("\u001f")' "$data_file" |
+    while IFS=$'\x1f' read -r nick link; do
+        target=${link//\{\{id\}\}/$uuid}
+        target=${target//\{\{name\}\}/$name}
+        if [ -n "$nick" ]; then
+            label=$nick
+        else
+            label=${target#*://}
+            label=${label%%/*}
+        fi
+        rc=0
+        resp=$(curl -sS --max-time 20 -w '\n%{http_code}' "$target" 2>/dev/null) || rc=$?
+        if [ "$rc" -ne 0 ]; then
+            printf '%s: %s: request failed (curl exit %s)\n' "$prog" "$label" "$rc" >&2
+            continue
+        fi
+        http=${resp##*$'\n'}
+        body=${resp%$'\n'*}
+        if [ "$http" != 200 ]; then
+            printf '%s: %s: HTTP %s\n' "$prog" "$label" "$http" >&2
+            continue
+        fi
+        if ! score=$(jq -r '.score.value // "-"' <<<"$body" 2>/dev/null); then
+            printf '%s: %s: bad response\n' "$prog" "$label" >&2
+            continue
+        fi
+        printf '%s  score %s\n' "$label" "$score"
+        tag_count=$(jq '.tags | length' <<<"$body" 2>/dev/null || echo 0)
+        if [ "$tag_count" -eq 0 ]; then
+            printf '  no tags\n'
+            continue
+        fi
+        while IFS= read -r tag; do
+            icon=$(jq -r '.icon // ""' <<<"$tag")
+            tooltip=$(jq -r '.tooltip // ""' <<<"$tag")
+            color=$(jq -r '.color // 0' <<<"$tag")
+            print_tag "$icon" "$tooltip" "$color"
+        done < <(jq -c '.tags[]' <<<"$body")
+    done
