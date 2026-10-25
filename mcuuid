@@ -1,0 +1,829 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+prog=${0##*/}
+scale=${MCUUID_SCALE:-2}
+
+die() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+    exit 1
+}
+
+note() {
+    printf '%s: %s\n' "$prog" "$1" >&2
+}
+
+usage() {
+    printf 'Usage: %s <username|uuid>\n' "$prog" >&2
+    exit 2
+}
+
+[ "$#" -eq 1 ] || usage
+input=$1
+[ -n "$input" ] || usage
+
+tmpdir=""
+trap 'if [ -n "$tmpdir" ]; then rm -rf "$tmpdir"; fi' EXIT
+
+uuid_re='^([0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+name_re='^[A-Za-z0-9_]{1,16}$'
+
+preloaded=""
+if [[ $input =~ $uuid_re ]]; then
+    bare=$(printf '%s' "${input//-/}" | tr 'A-F' 'a-f')
+    url="https://sessionserver.mojang.com/session/minecraft/profile/$bare"
+elif [[ $input =~ $name_re ]]; then
+    url="https://api.mojang.com/users/profiles/minecraft/$input"
+else
+    die "not a valid username or UUID: $input"
+fi
+
+resp=$(curl -sS --max-time 15 -w '\n%{http_code}' "$url" 2>/dev/null) || {
+    status=$?
+    if [ "$status" -eq 28 ]; then
+        die "timed out talking to the Mojang API"
+    fi
+    die "could not reach the Mojang API (curl exit $status)"
+}
+code=${resp##*$'\n'}
+body=${resp%$'\n'*}
+case $code in
+    200) ;;
+    204|404) die "no profile found for '$input'" ;;
+    429) die "Mojang is rate limiting requests; try again shortly" ;;
+    *) die "lookup failed for '$input' (HTTP $code)" ;;
+esac
+
+flat=$(printf '%s' "$body" | tr -d '\r\n')
+
+id=""
+name=""
+if [[ $flat =~ \"id\"[[:space:]]*:[[:space:]]*\"([0-9a-fA-F]{32})\" ]]; then
+    id=$(printf '%s' "${BASH_REMATCH[1]}" | tr 'A-F' 'a-f')
+fi
+if [[ $flat =~ \"name\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+    name=${BASH_REMATCH[1]}
+fi
+
+[ -n "$id" ] && [ -n "$name" ] || die "no profile found for '$input'"
+
+uuid=$(printf '%s' "$id" | sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12})$/\1-\2-\3-\4-\5/')
+
+if [[ $input =~ $uuid_re ]]; then
+    preloaded=$body
+fi
+
+printf 'UUID: %s\nName: %s\n' "$uuid" "$name"
+
+if [ -n "${NO_COLOR:-}" ]; then
+    exit 0
+fi
+
+case ${COLORTERM:-} in
+    *truecolor*|*24bit*) color_mode=true ;;
+    *) color_mode=256 ;;
+esac
+
+if ! [[ $scale =~ ^[1-9][0-9]?$ ]]; then
+    scale=2
+fi
+
+
+LEN_BASE=(3 4 5 6 7 8 9 10 11 13 15 17 19 23 27 31 35 43 51 59 67 83 99 115 131 163 195 227 258)
+LEN_EXTRA=(0 0 0 0 0 0 0 0 1 1 1 1 2 2 2 2 3 3 3 3 4 4 4 4 5 5 5 5 0)
+DIST_BASE=(1 2 3 4 5 7 9 13 17 25 33 49 65 97 129 193 257 385 513 769 1025 1537 2049 3073 4097 6145 8193 12289 16385 24577)
+DIST_EXTRA=(0 0 0 0 1 1 2 2 3 3 4 4 5 5 6 6 7 7 8 8 9 9 10 10 11 11 12 12 13 13)
+CL_ORDER=(16 17 18 0 8 7 9 6 10 5 11 4 12 3 13 2 14 1 15)
+
+getbits() {
+    local n=$1 bi=$(( BP >> 3 )) off=$(( BP & 7 ))
+    local w=$(( IN[bi] | (IN[bi + 1] << 8) | (IN[bi + 2] << 16) ))
+    GB=$(( (w >> off) & ((1 << n) - 1) ))
+    BP=$(( BP + n ))
+}
+
+build_huff() {
+    local n=$1 off=$2 base=$3 i len sym code rev k cnt first
+    for ((len = 0; len <= 15; len++)); do
+        H_COUNT[len]=0
+    done
+    H_SYM=()
+    for ((i = 0; i < n; i++)); do
+        len=${LEN[off + i]}
+        H_COUNT[len]=$(( H_COUNT[len] + 1 ))
+    done
+
+    local -a start=() at=()
+    start[1]=0
+    for ((len = 1; len < 15; len++)); do
+        start[len + 1]=$(( start[len] + H_COUNT[len] ))
+    done
+    for ((len = 1; len <= 15; len++)); do
+        at[len]=${start[len]}
+    done
+    for ((i = 0; i < n; i++)); do
+        len=${LEN[off + i]}
+        if [ "$len" -gt 0 ]; then
+            H_SYM[at[len]]=$i
+            at[len]=$(( at[len] + 1 ))
+        fi
+    done
+
+    for ((i = 0; i < 256; i++)); do
+        FAST[base + i]=-1
+    done
+    first=0
+    for ((len = 1; len <= 8; len++)); do
+        cnt=${H_COUNT[len]}
+        for ((i = 0; i < cnt; i++)); do
+            sym=${H_SYM[start[len] + i]}
+            code=$(( first + i ))
+            rev=0
+            for ((k = 0; k < len; k++)); do
+                rev=$(( (rev << 1) | ((code >> k) & 1) ))
+            done
+            for ((k = 0; k < (1 << (8 - len)); k++)); do
+                FAST[base + rev + (k << len)]=$(( (sym << 4) | len ))
+            done
+        done
+        first=$(( (first + cnt) << 1 ))
+    done
+}
+
+decode_cl() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${CL_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#CL_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${CL_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_lit() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${LC_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#LC_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${LC_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_dist() {
+    local bi off peek ent code first index len c idx bit
+    if [ "$BP" -ge "$BLIMIT" ]; then
+        return 1
+    fi
+    bi=$(( BP >> 3 ))
+    off=$(( BP & 7 ))
+    peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+    ent=${FAST[256 + peek]:--1}
+    if [ "$ent" -ge 0 ]; then
+        HSYM=$(( ent >> 4 ))
+        BP=$(( BP + (ent & 15) ))
+        return 0
+    fi
+    code=0
+    first=0
+    index=0
+    for ((len = 1; len <= 15; len++)); do
+        bit=$(( (IN[BP >> 3] >> (BP & 7)) & 1 ))
+        BP=$(( BP + 1 ))
+        code=$(( code | bit ))
+        c=${DC_COUNT[len]}
+        if [ "$c" -gt 0 ] && [ $(( code - first )) -lt "$c" ]; then
+            idx=$(( index + code - first ))
+            if [ "$idx" -ge "${#DC_SYM[@]}" ]; then
+                return 1
+            fi
+            HSYM=${DC_SYM[idx]}
+            return 0
+        fi
+        index=$(( index + c ))
+        first=$(( (first + c) << 1 ))
+        code=$(( code << 1 ))
+    done
+    return 1
+}
+
+decode_block() {
+    local sym li lev len dsym dist k bi off peek ent
+    while :; do
+        if [ "$BP" -ge "$BLIMIT" ]; then
+            note "corrupt skin data (truncated stream)"
+            return 1
+        fi
+        bi=$(( BP >> 3 ))
+        off=$(( BP & 7 ))
+        peek=$(( ((IN[bi] | (IN[bi + 1] << 8)) >> off) & 255 ))
+        ent=${FAST[peek]:--1}
+        if [ "$ent" -ge 0 ]; then
+            sym=$(( ent >> 4 ))
+            BP=$(( BP + (ent & 15) ))
+        else
+            decode_lit || { note "corrupt skin data (truncated stream)"; return 1; }
+            sym=$HSYM
+        fi
+        if [ "$sym" -lt 256 ]; then
+            OUT[OP]=$sym
+            OP=$(( OP + 1 ))
+            continue
+        fi
+        if [ "$sym" -eq 256 ]; then
+            return 0
+        fi
+        li=$(( sym - 257 ))
+        if [ "$li" -ge 29 ]; then
+            note "corrupt skin data (length code $sym)"
+            return 1
+        fi
+        len=${LEN_BASE[li]}
+        lev=${LEN_EXTRA[li]}
+        if [ "$lev" -gt 0 ]; then
+            getbits "$lev"
+            len=$(( len + GB ))
+        fi
+        decode_dist || { note "corrupt skin data (truncated stream)"; return 1; }
+        dsym=$HSYM
+        if [ "$dsym" -ge 30 ]; then
+            note "corrupt skin data (distance code $dsym)"
+            return 1
+        fi
+        dist=${DIST_BASE[dsym]}
+        lev=${DIST_EXTRA[dsym]}
+        if [ "$lev" -gt 0 ]; then
+            getbits "$lev"
+            dist=$(( dist + GB ))
+        fi
+        if [ "$dist" -gt "$OP" ]; then
+            note "corrupt skin data (bad distance)"
+            return 1
+        fi
+        for ((k = 0; k < len; k++)); do
+            OUT[OP]=${OUT[OP - dist]}
+            OP=$(( OP + 1 ))
+        done
+    done
+}
+
+inflate_zlib() {
+    local last=0 btype i k n len nlen hlit hdist hclen sym lev total idx
+    local aligned ip
+    BP=16
+    OP=0
+    LEN=()
+    BLIMIT=$(( (INN + 8) * 8 ))
+
+    while [ "$last" -eq 0 ]; do
+        getbits 1
+        last=$GB
+        getbits 2
+        btype=$GB
+        case $btype in
+            0)
+                aligned=$(( ((BP + 7) >> 3) << 3 ))
+                ip=$(( aligned >> 3 ))
+                len=$(( IN[ip] | (IN[ip + 1] << 8) ))
+                nlen=$(( IN[ip + 2] | (IN[ip + 3] << 8) ))
+                ip=$(( ip + 4 ))
+                if [ "$len" -ne $(( (~nlen) & 65535 )) ]; then
+                    note "corrupt skin data (stored block length)"
+                    return 1
+                fi
+                for ((k = 0; k < len; k++)); do
+                    OUT[OP]=$(( IN[ip] ))
+                    OP=$(( OP + 1 ))
+                    ip=$(( ip + 1 ))
+                done
+                BP=$(( ip << 3 ))
+                ;;
+            1)
+                LEN=()
+                for ((k = 0; k < 144; k++)); do LEN[k]=8; done
+                for ((k = 144; k < 256; k++)); do LEN[k]=9; done
+                for ((k = 256; k < 280; k++)); do LEN[k]=7; done
+                for ((k = 280; k < 288; k++)); do LEN[k]=8; done
+                build_huff 288 0 0
+                LC_COUNT=("${H_COUNT[@]}")
+                LC_SYM=("${H_SYM[@]}")
+                LEN=()
+                for ((k = 0; k < 32; k++)); do LEN[k]=5; done
+                build_huff 32 0 256
+                DC_COUNT=("${H_COUNT[@]}")
+                DC_SYM=("${H_SYM[@]}")
+                decode_block || return 1
+                ;;
+            2)
+                getbits 5
+                hlit=$(( GB + 257 ))
+                getbits 5
+                hdist=$(( GB + 1 ))
+                getbits 4
+                hclen=$(( GB + 4 ))
+                LEN=()
+                for ((k = 0; k < 19; k++)); do LEN[k]=0; done
+                for ((k = 0; k < hclen; k++)); do
+                    getbits 3
+                    LEN[CL_ORDER[k]]=$GB
+                done
+                build_huff 19 0 0
+                CL_COUNT=("${H_COUNT[@]}")
+                CL_SYM=("${H_SYM[@]}")
+                total=$(( hlit + hdist ))
+                LEN=()
+                idx=0
+                while [ "$idx" -lt "$total" ]; do
+                    decode_cl || { note "corrupt skin data (code lengths)"; return 1; }
+                    sym=$HSYM
+                    if [ "$sym" -lt 16 ]; then
+                        LEN[idx]=$sym
+                        idx=$(( idx + 1 ))
+                    elif [ "$sym" -eq 16 ]; then
+                        if [ "$idx" -eq 0 ]; then
+                            note "corrupt skin data (repeat)"
+                            return 1
+                        fi
+                        getbits 2
+                        n=$(( GB + 3 ))
+                        lev=${LEN[idx - 1]}
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=$lev
+                            idx=$(( idx + 1 ))
+                        done
+                    elif [ "$sym" -eq 17 ]; then
+                        getbits 3
+                        n=$(( GB + 3 ))
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=0
+                            idx=$(( idx + 1 ))
+                        done
+                    else
+                        getbits 7
+                        n=$(( GB + 11 ))
+                        for ((k = 0; k < n; k++)); do
+                            LEN[idx]=0
+                            idx=$(( idx + 1 ))
+                        done
+                    fi
+                done
+                build_huff "$hlit" 0 0
+                LC_COUNT=("${H_COUNT[@]}")
+                LC_SYM=("${H_SYM[@]}")
+                build_huff "$hdist" "$hlit" 256
+                DC_COUNT=("${H_COUNT[@]}")
+                DC_SYM=("${H_SYM[@]}")
+                decode_block || return 1
+                ;;
+            *)
+                note "corrupt skin data (block type $btype)"
+                return 1
+                ;;
+        esac
+        if [ "$OP" -gt 2000000 ]; then
+            note "skin data is implausibly large"
+            return 1
+        fi
+    done
+}
+
+decode_skin() {
+    local png=$1 i pos=0 len tag bytes
+    local -a PNG=()
+    local cp_depth=0 cp_type=0 cp_interlace=0
+    local stride
+
+    W=0
+    H=0
+    CH=4
+    IN=()
+    INN=0
+
+    bytes=$(wc -c < "$png")
+    if ! { mapfile -t PNG < <(od -v -An -tu1 -w1 "$png" 2>/dev/null | tr -d ' ') &&
+        [ "${#PNG[@]}" -eq "$bytes" ]; }; then
+        PNG=()
+        mapfile -t PNG < <(xxd -p -c 1 "$png" 2>/dev/null)
+        for i in "${!PNG[@]}"; do
+            PNG[i]=$((16#${PNG[i]}))
+        done
+    fi
+    if [ "${#PNG[@]}" -lt 8 ] ||
+        [ "${PNG[0]}" -ne 137 ] || [ "${PNG[1]}" -ne 80 ] ||
+        [ "${PNG[2]}" -ne 78 ] || [ "${PNG[3]}" -ne 71 ] ||
+        [ "${PNG[4]}" -ne 13 ] || [ "${PNG[5]}" -ne 10 ] ||
+        [ "${PNG[6]}" -ne 26 ] || [ "${PNG[7]}" -ne 10 ]; then
+        note "skin is not a PNG"
+        return 1
+    fi
+
+    pos=8
+    while [ $((pos + 8)) -le "${#PNG[@]}" ]; do
+        len=$(( (PNG[pos] << 24) | (PNG[pos + 1] << 16) | (PNG[pos + 2] << 8) | PNG[pos + 3] ))
+        if [ $(( pos + 12 + len )) -gt "${#PNG[@]}" ]; then
+            note "skin PNG is truncated"
+            return 1
+        fi
+        tag="${PNG[pos + 4]},${PNG[pos + 5]},${PNG[pos + 6]},${PNG[pos + 7]}"
+        case $tag in
+            73,72,68,82)
+                W=$(( (PNG[pos + 8] << 24) | (PNG[pos + 9] << 16) | (PNG[pos + 10] << 8) | PNG[pos + 11] ))
+                H=$(( (PNG[pos + 12] << 24) | (PNG[pos + 13] << 16) | (PNG[pos + 14] << 8) | PNG[pos + 15] ))
+                cp_depth=${PNG[pos + 16]}
+                cp_type=${PNG[pos + 17]}
+                cp_interlace=${PNG[pos + 20]}
+                ;;
+            73,68,65,84)
+                for ((i = 0; i < len; i++)); do
+                    IN[INN]=${PNG[pos + 8 + i]}
+                    INN=$(( INN + 1 ))
+                done
+                ;;
+            73,69,78,68)
+                break
+                ;;
+        esac
+        pos=$(( pos + 12 + len ))
+    done
+
+    if [ "$W" -eq 0 ] || [ "$H" -eq 0 ]; then
+        note "skin PNG has no readable header"
+        return 1
+    fi
+    if [ "$cp_depth" -ne 8 ]; then
+        note "unsupported skin PNG (bit depth $cp_depth)"
+        return 1
+    fi
+    if [ "$cp_type" -ne 6 ] && [ "$cp_type" -ne 2 ]; then
+        note "unsupported skin PNG (colour type $cp_type)"
+        return 1
+    fi
+    if [ "$cp_interlace" -ne 0 ]; then
+        note "interlaced skin PNGs are not supported"
+        return 1
+    fi
+    if [ "$INN" -eq 0 ]; then
+        note "skin PNG has no image data"
+        return 1
+    fi
+    if [ "$cp_type" -eq 2 ]; then
+        CH=3
+    fi
+
+    for ((i = 0; i < 16; i++)); do
+        IN[INN + i]=0
+    done
+
+    stride=$(( W * CH ))
+    if ! inflate_zlib; then
+        return 1
+    fi
+    if [ "$OP" -lt $(( (stride + 1) * H )) ]; then
+        note "skin data is truncated"
+        return 1
+    fi
+
+    local y x base off ft v a b c p pa pb pc pr
+    for ((y = 0; y < H; y++)); do
+        base=$(( y * stride ))
+        off=$(( y * (stride + 1) + 1 ))
+        ft=${OUT[y * (stride + 1)]}
+        case $ft in
+            0)
+                for ((x = 0; x < stride; x++)); do
+                    PIX[base + x]=${OUT[off + x]}
+                done
+                ;;
+            1)
+                for ((x = 0; x < CH && x < stride; x++)); do
+                    PIX[base + x]=${OUT[off + x]}
+                done
+                for ((x = CH; x < stride; x++)); do
+                    PIX[base + x]=$(( (${OUT[off + x]} + PIX[base + x - CH]) & 255 ))
+                done
+                ;;
+            2)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                else
+                    for ((x = 0; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base - stride + x]) & 255 ))
+                    done
+                fi
+                ;;
+            3)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + (PIX[base + x - CH] >> 1)) & 255 ))
+                    done
+                else
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + (PIX[base - stride + x] >> 1)) & 255 ))
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + ((PIX[base + x - CH] + PIX[base - stride + x]) >> 1)) & 255 ))
+                    done
+                fi
+                ;;
+            4)
+                if [ "$y" -eq 0 ]; then
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=${OUT[off + x]}
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base + x - CH]) & 255 ))
+                    done
+                else
+                    for ((x = 0; x < CH && x < stride; x++)); do
+                        PIX[base + x]=$(( (${OUT[off + x]} + PIX[base - stride + x]) & 255 ))
+                    done
+                    for ((x = CH; x < stride; x++)); do
+                        v=${OUT[off + x]}
+                        a=${PIX[base + x - CH]}
+                        b=${PIX[base - stride + x]}
+                        c=${PIX[base - stride + x - CH]}
+                        p=$(( a + b - c ))
+                        pa=$(( p > a ? p - a : a - p ))
+                        pb=$(( p > b ? p - b : b - p ))
+                        pc=$(( p > c ? p - c : c - p ))
+                        if [ "$pa" -le "$pb" ] && [ "$pa" -le "$pc" ]; then
+                            pr=$a
+                        elif [ "$pb" -le "$pc" ]; then
+                            pr=$b
+                        else
+                            pr=$c
+                        fi
+                        PIX[base + x]=$(( (v + pr) & 255 ))
+                    done
+                fi
+                ;;
+            *)
+                note "corrupt skin PNG (filter $ft)"
+                return 1
+                ;;
+        esac
+    done
+}
+
+blit() {
+    local dx=$1 dy=$2 sx=$3 sy=$4 w=$5 h=$6 mir=$7
+    local xx yy gx si di r g b a da keep na
+    for ((yy = 0; yy < h; yy++)); do
+        for ((xx = 0; xx < w; xx++)); do
+            gx=$(( mir ? sx + w - 1 - xx : sx + xx ))
+            si=$(( ((sy + yy) * W + gx) * CH ))
+            r=${PIX[si]}
+            g=${PIX[si + 1]}
+            b=${PIX[si + 2]}
+            if [ "$CH" -eq 4 ]; then
+                a=${PIX[si + 3]}
+            else
+                a=255
+            fi
+            if [ "$a" -eq 0 ]; then
+                continue
+            fi
+            di=$(( (dy + yy) * 16 + dx + xx ))
+            if [ "$a" -eq 255 ]; then
+                SR[di]=$r
+                SG[di]=$g
+                SB[di]=$b
+                SA[di]=255
+                continue
+            fi
+            da=${SA[di]}
+            keep=$(( da * (255 - a) / 255 ))
+            na=$(( a + keep ))
+            SR[di]=$(( (r * a + SR[di] * keep) / na ))
+            SG[di]=$(( (g * a + SG[di] * keep) / na ))
+            SB[di]=$(( (b * a + SB[di] * keep) / na ))
+            SA[di]=$na
+        done
+    done
+}
+
+c256() {
+    local r=$1 g=$2 b=$3 avg
+    local dr=$(( r > g ? r - g : g - r ))
+    local dg=$(( g > b ? g - b : b - g ))
+    if [ "$dr" -lt 10 ] && [ "$dg" -lt 10 ]; then
+        avg=$(( (r + g + b) / 3 ))
+        if [ "$avg" -lt 8 ]; then
+            C=16
+        elif [ "$avg" -gt 238 ]; then
+            C=231
+        else
+            C=$(( 232 + (avg - 8) / 10 ))
+        fi
+    else
+        local ir=$(( r < 48 ? 0 : (r > 238 ? 5 : (r - 35) / 40) ))
+        local ig=$(( g < 48 ? 0 : (g > 238 ? 5 : (g - 35) / 40) ))
+        local ib=$(( b < 48 ? 0 : (b > 238 ? 5 : (b - 35) / 40) ))
+        C=$(( 16 + 36 * ir + 6 * ig + ib ))
+    fi
+}
+
+emit_skin() {
+    local GW=$((16 * scale)) GH=$((32 * scale))
+    local -a GR=() GG=() GB=() GA=()
+    local x y sy sx si gi ti bi line
+    local esc=$'\033' ct cb
+    for ((y = 0; y < GH; y++)); do
+        sy=$((y / scale))
+        for ((x = 0; x < GW; x++)); do
+            sx=$((x / scale))
+            si=$((sy * 16 + sx))
+            gi=$((y * GW + x))
+            GR[gi]=${SR[si]}
+            GG[gi]=${SG[si]}
+            GB[gi]=${SB[si]}
+            GA[gi]=${SA[si]}
+        done
+    done
+
+    for ((y = 0; y < GH; y += 2)); do
+        line=""
+        for ((x = 0; x < GW; x++)); do
+            ti=$((y * GW + x))
+            bi=$((ti + GW))
+            if [ "$color_mode" = true ]; then
+                if [ "${GA[ti]}" -gt 0 ] && [ "${GA[bi]}" -gt 0 ]; then
+                    line+="$esc[38;2;${GR[ti]};${GG[ti]};${GB[ti]}m$esc[48;2;${GR[bi]};${GG[bi]};${GB[bi]}m▀"
+                elif [ "${GA[ti]}" -gt 0 ]; then
+                    line+="$esc[49m$esc[38;2;${GR[ti]};${GG[ti]};${GB[ti]}m▀"
+                elif [ "${GA[bi]}" -gt 0 ]; then
+                    line+="$esc[49m$esc[38;2;${GR[bi]};${GG[bi]};${GB[bi]}m▄"
+                else
+                    line+="$esc[49m "
+                fi
+            else
+                if [ "${GA[ti]}" -gt 0 ] && [ "${GA[bi]}" -gt 0 ]; then
+                    c256 "${GR[ti]}" "${GG[ti]}" "${GB[ti]}"
+                    ct=$C
+                    c256 "${GR[bi]}" "${GG[bi]}" "${GB[bi]}"
+                    cb=$C
+                    line+="$esc[38;5;${ct}m$esc[48;5;${cb}m▀"
+                elif [ "${GA[ti]}" -gt 0 ]; then
+                    c256 "${GR[ti]}" "${GG[ti]}" "${GB[ti]}"
+                    line+="$esc[49m$esc[38;5;${C}m▀"
+                elif [ "${GA[bi]}" -gt 0 ]; then
+                    c256 "${GR[bi]}" "${GG[bi]}" "${GB[bi]}"
+                    line+="$esc[49m$esc[38;5;${C}m▄"
+                else
+                    line+="$esc[49m "
+                fi
+            fi
+        done
+        printf '%s\n' "$line$esc[0m"
+    done
+}
+
+render_skin() {
+    local png=$1
+    local -a PIX=() SR=() SG=() SB=() SA=()
+    local i legacy=0
+
+    decode_skin "$png" || return 1
+
+    for ((i = 0; i < 512; i++)); do
+        SR[i]=0
+        SG[i]=0
+        SB[i]=0
+        SA[i]=0
+    done
+
+    if [ "$H" -eq 32 ]; then
+        legacy=1
+    fi
+
+    blit 4 0 8 8 8 8 0
+    blit 4 8 20 20 8 12 0
+    blit 0 8 44 20 4 12 0
+    blit 4 20 4 20 4 12 0
+    if [ "$legacy" -eq 1 ]; then
+        blit 12 8 44 20 4 12 1
+        blit 8 20 4 20 4 12 1
+    else
+        blit 12 8 36 52 4 12 0
+        blit 8 20 20 52 4 12 0
+        blit 4 0 40 8 8 8 0
+        blit 4 8 20 36 8 12 0
+        blit 0 8 44 36 4 12 0
+        blit 12 8 52 52 4 12 0
+        blit 4 20 4 36 4 12 0
+        blit 8 20 4 52 4 12 0
+    fi
+
+    emit_skin
+}
+
+
+draw_skin() {
+    local id=$1 name=$2 prefetched=$3 profile b64 tex_json skin_url resp code png
+
+    if [ -n "$prefetched" ]; then
+        profile=$prefetched
+    else
+        resp=$(curl -sS --max-time 15 -w '\n%{http_code}' \
+            "https://sessionserver.mojang.com/session/minecraft/profile/$id" 2>/dev/null) || {
+            note "could not reach the Mojang API"
+            return 0
+            }
+        code=${resp##*$'\n'}
+        profile=${resp%$'\n'*}
+        case $code in
+            200) ;;
+            204) note "no skin is set for $name"; return 0 ;;
+            404) note "no profile found for '$name'"; return 0 ;;
+            429) note "Mojang is rate limiting requests; try again shortly"; return 0 ;;
+            *) note "could not fetch the skin profile (HTTP $code)"; return 0 ;;
+        esac
+    fi
+
+    b64=$(printf '%s' "$profile" | tr -d '\r\n' |
+        sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"textures"[^}]*"value"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [ -z "$b64" ]; then
+        note "no skin is set for $name"
+        return 0
+    fi
+
+    tex_json=$(printf '%s' "$b64" | base64 -d 2>/dev/null | tr -d '\r\n' || true)
+    skin_url=$(printf '%s' "$tex_json" |
+        sed -n 's|.*"SKIN"[[:space:]]*:[[:space:]]*{[^}]*"url"[[:space:]]*:[[:space:]]*"\([^"]*\)".*|\1|p' |
+        sed 's|^http://|https://|')
+    if [ -z "$skin_url" ]; then
+        note "no skin texture found for $name"
+        return 0
+    fi
+
+    tmpdir=$(mktemp -d) || { note "could not create a temporary directory"; return 0; }
+    png=$tmpdir/skin.png
+    if ! curl -fsS --max-time 20 -o "$png" "$skin_url" 2>/dev/null; then
+        note "could not download the skin"
+        return 0
+    fi
+
+    printf '\n'
+    render_skin "$png" || return 0
+}
+
+draw_skin "$id" "$name" "$preloaded"
