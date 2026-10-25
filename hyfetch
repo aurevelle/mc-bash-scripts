@@ -158,6 +158,7 @@ plus_color() {
         RED) PC=$((0xFF5555)) ;;
         BLUE) PC=$((0x5555FF)) ;;
         GREEN) PC=$((0x55FF55)) ;;
+        AQUA) PC=$((0x55FFFF)) ;;
         YELLOW) PC=$((0xFFFF55)) ;;
         GOLD) PC=$((0xFFAA00)) ;;
         LIGHT_PURPLE) PC=$((0xFF55FF)) ;;
@@ -279,11 +280,7 @@ build_rank() {
             RANK_TAG="$(bseg "$aqua" '[MVP')$(bseg "$PC" '+')$(bseg "$aqua" ']') "
             ;;
         MVP_PLUS_PLUS)
-            if [ "$PC" -eq $((0xFF5555)) ]; then
-                RANK_TAG="$(bseg "$gold" '[MVP')$(bseg "$PC" '++')$(bseg "$gold" ']') "
-            else
-                RANK_TAG="$(bseg "$gold" '[MVP')$(bseg "$PC" '+')$(bseg "$gold" '+]') "
-            fi
+            RANK_TAG="$(bseg "$gold" '[MVP')$(bseg "$PC" '++')$(bseg "$gold" ']') "
             ;;
     esac
 }
