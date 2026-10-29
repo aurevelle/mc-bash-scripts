@@ -163,6 +163,7 @@ plus_color() {
         GOLD) PC=$((0xFFAA00)) ;;
         LIGHT_PURPLE) PC=$((0xFF55FF)) ;;
         WHITE) PC=$((0xFFFFFF)) ;;
+        BLACK) PC=$((0x222222)) ;;
         DARK_AQUA) PC=$((0x00AAAA)) ;;
         DARK_BLUE) PC=$((0x0000AA)) ;;
         DARK_GRAY) PC=$((0x555555)) ;;
@@ -1240,7 +1241,7 @@ read_api() {
         (.player.rank // ""),
         (.player.newPackageRank // ""),
         (.player.monthlyPackageRank // ""),
-        (.player.monthlyRankColor // ""),
+        (.player.rankPlusColor // ""),
         (.player.prefix // ""),
         (.player.packageRank // "")
     ] | map(tostring) | join("\u001f")' "$1" 2>/dev/null) || rank_line=""
