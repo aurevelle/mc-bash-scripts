@@ -1240,7 +1240,7 @@ read_api() {
         (.player.rank // ""),
         (.player.newPackageRank // ""),
         (.player.monthlyPackageRank // ""),
-        (.player.rankPlusColor // ""),
+        (.player.monthlyRankColor // ""),
         (.player.prefix // ""),
         (.player.packageRank // "")
     ] | map(tostring) | join("\u001f")' "$1" 2>/dev/null) || rank_line=""
